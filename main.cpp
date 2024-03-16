@@ -1,8 +1,12 @@
+#include <deque>
 #include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <queue>
 #include <ranges>
 #include <set>
+#include <shared_mutex>
 #include <vector>
 
 constexpr time_t SECONDS_PER_LINE_BUFFER = 1;
@@ -14,8 +18,12 @@ class CLineBuffer {
 
         typedef std::vector < std::string > t_lines;
         t_lines m_lines;
+        time_t m_timestamp = 0;
 
     public:
+
+        CLineBuffer() = delete;
+        explicit CLineBuffer( const time_t ts ) : m_timestamp( ts ) {}
 
         void Push( const std::string & line ) {
             m_lines.push_back( line );
@@ -28,10 +36,13 @@ class CLineBuffer {
         const std::string & GetItem( const unsigned int n ) const {
             return m_lines[ n ];
         }
+
+        time_t GetTimestamp() const {
+            return m_timestamp;
+        }
 };
 typedef std::shared_ptr < CLineBuffer > PLineBuffer;
-
-typedef std::map < time_t, PLineBuffer > t_line_buffers;
+typedef std::queue< PLineBuffer > t_line_buffers;
 
 class CEventBuffer {
 
@@ -41,10 +52,12 @@ class CEventBuffer {
         typedef std::map < std::string, t_event > t_event_map;
 
         t_event_map m_events;
+        mutable std::shared_mutex m_mutex;
 
     public:
 
         void Push( const time_t ts, const std::string & id, const std::string & s ) {
+            std::unique_lock < std::shared_mutex > lock( m_mutex );
             m_events.emplace( std::make_pair( id, std::make_tuple( ts, s ) ) );
         }
 
@@ -52,10 +65,28 @@ class CEventBuffer {
             bool bResult = false;
             value.clear();
             ts = 0;
+            std::shared_lock < std::shared_mutex > lock( m_mutex );
             const auto & it = m_events.find( id );
             if ( it != m_events.end() ) {
                 ts = std::get< 0 >( it->second );
                 value = std::get< 1 >( it->second );
+                bResult = true;
+            }
+            return bResult;
+        }
+
+        bool Pop( std::string & id, std::string & value, time_t & ts ) {
+            bool bResult = false;
+            id.clear();
+            value.clear();
+            ts = 0;
+            std::unique_lock < std::shared_mutex > lock( m_mutex );
+            const auto & it = m_events.begin();
+            if ( it != m_events.end() ) {
+                id = it->first;
+                ts = std::get< 0 >( it->second );
+                value = std::get< 1 >( it->second );
+                m_events.erase( it );
                 bResult = true;
             }
             return bResult;
@@ -66,28 +97,57 @@ typedef std::shared_ptr < CEventBuffer > PEventBuffer;
 typedef std::map < time_t, PEventBuffer > t_event_buffers;
 
 class CEventBuffers {
+
     private:
+
         t_event_buffers m_event_buffers;
-    public:
-        void Push( const time_t ts, const std::string & id, const std::string & s ) {
-            time_t time_key = ts / SECONDS_PER_EVENT_BUFFER;
-            PEventBuffer event_buffer;
+        mutable std::shared_mutex m_mutex;
+
+    protected:
+
+        void GetBuffer( const time_t time_key, PEventBuffer & event_buffer, const bool bCanAdd ) {
+            event_buffer.reset();
             if (
                 auto it = m_event_buffers.find( time_key );
                 it == m_event_buffers.end()
             ) {
-                event_buffer = std::make_shared < CEventBuffer >();
-                m_event_buffers.emplace( std::make_pair( time_key, event_buffer ) );
+                if ( bCanAdd ) {
+                    event_buffer = std::make_shared < CEventBuffer >();
+                    m_event_buffers.emplace( std::make_pair( time_key, event_buffer ) );
+                }
             } else {
                 event_buffer = it->second;
             }
-            event_buffer->Push( ts, id, s );
+        }
+
+    public:
+
+        void Push( const time_t ts, const std::string & id, const std::string & s ) {
+            time_t time_key = ts / SECONDS_PER_EVENT_BUFFER;
+            PEventBuffer event_buffer;
+            {
+                bool bCanAdd = false;
+                std::shared_lock < std::shared_mutex > lock( m_mutex );
+                GetBuffer( time_key, event_buffer, bCanAdd );
+            }
+            if ( !event_buffer ) {
+                // need to add?
+                bool bCanAdd = true;
+                std::unique_lock < std::shared_mutex > lock( m_mutex );
+                GetBuffer( time_key, event_buffer, bCanAdd );
+            }
+            if ( event_buffer ) {
+                event_buffer->Push( ts, id, s );
+            } else {
+                // assert( false );
+            }
         }
 
         bool GetByID( const std::string & id, std::string & value, time_t & ts ) const {
             bool bResult = false;
             value.clear();
             ts = 0;
+            std::shared_lock < std::shared_mutex > lock( m_mutex );
             for ( const auto & [ buffer_timestamp, buffer ] : std::ranges::reverse_view( m_event_buffers ) ) {
                 if ( buffer->GetByID( id, value, ts ) ) {
                     bResult = true;
@@ -95,6 +155,17 @@ class CEventBuffers {
                 }
             }
             return bResult;
+        }
+
+        bool PopBuffer( PEventBuffer & event_buffer ) {
+            event_buffer.reset();
+            std::unique_lock < std::shared_mutex > lock( m_mutex );
+            auto it = m_event_buffers.begin();
+            if ( it != m_event_buffers.end() ) {
+                event_buffer = it->second;
+                m_event_buffers.erase( it );
+            }
+            return !!event_buffer;
         }
 };
 
@@ -107,7 +178,6 @@ class CMessageProcessor {
         std::string m_request_path;
         std::string m_result_code;
         bool m_bIsResponse = false;
-        time_t m_timestamp = time( nullptr );
         bool m_bDone = true;
 
         void Reset() {
@@ -188,51 +258,102 @@ typedef std::map < std::string, std::string > t_string_to_string_map;
 typedef std::map < std::string, long long unsigned int > t_string_to_uint64_map;
 typedef std::map < std::string, t_string_to_uint64_map > t_string_to_string_to_uint64_map;
 
-int main() {
+CMessageProcessor mp;
+CEventBuffers request_map;
+CEventBuffers response_map;
+t_string_to_string_to_uint64_map result_map;
+t_line_buffers line_buffers;
+std::mutex line_buffers_mutex;
 
-    CMessageProcessor mp;
-    CEventBuffers request_map;
-    t_string_to_string_to_uint64_map result_map;
-    t_line_buffers line_buffers;
+PLineBuffer current_line_buffer;
 
-    PLineBuffer current_line_buffer;
-    time_t current_line_buffer_timestamp = 0;
-    while ( std::cin.good() ) {
-        if (
-            time_t ts = time( nullptr ) / SECONDS_PER_LINE_BUFFER;
-            ts != current_line_buffer_timestamp
-        ) {
-            current_line_buffer = std::make_shared < CLineBuffer >();
-            line_buffers[ ts ] = current_line_buffer;
-            current_line_buffer_timestamp = ts;
-        }
-        std::string input;
-        std::getline( std::cin, input );
-        current_line_buffer->Push( input );
-        //std::cout << input << std::endl;
-    }
+void ParseLineBuffer( const PLineBuffer & buffer ) {
 
-    for ( const auto & [ buffer_timestamp, buffer ] : line_buffers ) {
-        unsigned int line_count = buffer->GetCount();
-        for ( unsigned int i = 0; i < line_count; i++ ) {
-            mp.ProcessLine( buffer->GetItem( i ) );
-            if ( mp.IsDone() ) {
-                if ( mp.IsResponse() ) {
-                    time_t ts = 0;
-                    std::string request;
-                    if ( request_map.GetByID( mp.GetTraceID(), request, ts ) ) {
-                        //std::cout << "Response: " << mp.GetTraceID() << " " << mp.GetResultCode() << " " << request << std::endl;
-                        result_map[ request ][ mp.GetResultCode() ]++;
-                    } else {
-                        result_map[ "undefined" ][ mp.GetResultCode() ]++;
-                    }
-                } else {
-                    request_map.Push( buffer_timestamp, mp.GetTraceID(), mp.GetRequestPath() );
-                    //std::cout << "Request: " << mp.GetTraceID() << " " << mp.GetRequestPath() << std::endl;
-                }
+    unsigned int line_count = buffer->GetCount();
+    for ( unsigned int i = 0; i < line_count; i++ ) {
+        mp.ProcessLine( buffer->GetItem( i ) );
+        if ( mp.IsDone() ) {
+            if ( mp.IsResponse() ) {
+                response_map.Push( buffer->GetTimestamp(), mp.GetTraceID(), mp.GetResultCode() );
+            } else {
+                request_map.Push( buffer->GetTimestamp(), mp.GetTraceID(), mp.GetRequestPath() );
             }
         }
     }
+
+}
+
+void Aggregate() {
+    PEventBuffer buffer;
+    while ( response_map.PopBuffer( buffer ) ) {
+        std::string id;
+        time_t result_ts = 0;
+        std::string result_code;
+        while ( buffer->Pop( id, result_code, result_ts ) ) {
+            time_t ts = 0;
+            std::string request;
+            if ( request_map.GetByID( id, request, ts ) ) {
+                result_map[ request ][ result_code ]++;
+            } else {
+                result_map[ "undefined" ][ result_code ]++;
+            }
+        }
+    }
+}
+
+void ProcessLineBuffers() {
+    bool bDone = false;
+    do {
+        PLineBuffer buffer;
+        {
+            std::lock_guard < std::mutex > lock( line_buffers_mutex );
+            if ( line_buffers.empty() ) {
+                bDone = true;
+            } else {
+                buffer = line_buffers.front();
+                line_buffers.pop();
+            }
+        }
+        if ( buffer ) {
+            ParseLineBuffer( buffer );
+        }
+    } while( !bDone );
+}
+
+void FlushLineBuffer() {
+    if ( current_line_buffer ) {
+        {
+            std::lock_guard < std::mutex > lock( line_buffers_mutex );
+            line_buffers.push( current_line_buffer );
+        }
+        ProcessLineBuffers();
+    }
+}
+
+void ReadSTDIN() {
+
+    bool bPrevEmptyLine = false;
+    while ( std::cin.good() ) {
+        std::string input;
+        std::getline( std::cin, input );
+        if (
+            time_t ts = time( nullptr ) / SECONDS_PER_LINE_BUFFER;
+            !current_line_buffer
+            ||
+            ( current_line_buffer->GetTimestamp() != ts && bPrevEmptyLine && !input.empty() )
+        ) {
+            FlushLineBuffer();
+            current_line_buffer = std::make_shared < CLineBuffer >( ts );
+        }
+        current_line_buffer->Push( input );
+        bPrevEmptyLine = input.empty();
+        //std::cout << input << std::endl;
+    }
+    FlushLineBuffer();
+
+}
+
+void OutputStats() {
 
     std::set < std::string > result_codes;
     for ( const auto & stats : std::views::values( result_map ) ) {
@@ -253,6 +374,16 @@ int main() {
             std::cout << csv_separator << stats[ result_code ];
         }
     }
+
+}
+
+int main() {
+
+    ReadSTDIN();
+
+    Aggregate();
+
+    OutputStats();
 
     return 0;
 }
