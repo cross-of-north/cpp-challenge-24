@@ -13,6 +13,9 @@
 constexpr time_t SECONDS_PER_LINE_BUFFER = 1;
 constexpr time_t SECONDS_PER_EVENT_BUFFER = 1;
 constexpr time_t SECONDS_PER_OUTPUT = 5;
+constexpr time_t REQUEST_LIFETIME_IN_SECONDS = 5;
+
+//#define DEBUG_MEMORY_CONSUMPTION 1
 
 class CLineBuffer {
 
@@ -25,7 +28,17 @@ class CLineBuffer {
     public:
 
         CLineBuffer() = delete;
-        explicit CLineBuffer( const time_t ts ) : m_timestamp( ts ) {}
+        explicit CLineBuffer( const time_t ts ) : m_timestamp( ts ) {
+#ifdef DEBUG_MEMORY_CONSUMPTION
+            std::cout << m_timestamp << " CLineBuffer()" << std::endl;
+#endif // DEBUG_MEMORY_CONSUMPTION
+        }
+
+        ~CLineBuffer() {
+#ifdef DEBUG_MEMORY_CONSUMPTION
+            std::cout << m_timestamp << " ~CLineBuffer()" << std::endl;
+#endif // DEBUG_MEMORY_CONSUMPTION
+        }
 
         void Push( const std::string & line ) {
             m_lines.push_back( line );
@@ -57,6 +70,18 @@ class CEventBuffer {
         mutable std::shared_mutex m_mutex;
 
     public:
+
+        CEventBuffer() {
+#ifdef DEBUG_MEMORY_CONSUMPTION
+            std::cout << "CEventBuffer()" << std::endl;
+#endif // DEBUG_MEMORY_CONSUMPTION
+        }
+
+        ~CEventBuffer() {
+#ifdef DEBUG_MEMORY_CONSUMPTION
+            std::cout << "~CEventBuffer()" << std::endl;
+#endif // DEBUG_MEMORY_CONSUMPTION
+        }
 
         void Push( const time_t ts, const std::string & id, const std::string & s ) {
             std::unique_lock < std::shared_mutex > lock( m_mutex );
@@ -174,6 +199,19 @@ class CEventBuffers {
             std::shared_lock < std::shared_mutex > lock( m_mutex );
             return m_event_buffers.empty();
         }
+
+        void DiscardOlderThan( const time_t min_ts ) {
+            std::unique_lock < std::shared_mutex > lock( m_mutex );
+            for ( auto it = m_event_buffers.begin(); it != m_event_buffers.end(); ) {
+                if ( it->first < min_ts ) {
+                    it = m_event_buffers.erase( it );
+                } else {
+                    //++it;
+                    break;
+                }
+            }
+        }
+
 };
 
 class CMessageProcessor {
@@ -286,6 +324,8 @@ PLineBuffer current_line_buffer;
 
 void ParseLineBuffer( const PLineBuffer & buffer ) {
 
+    //std::cout << buffer->GetTimestamp() << " start parse " << buffer->GetCount() << std::endl;
+
     unsigned int line_count = buffer->GetCount();
     for ( unsigned int i = 0; i < line_count; i++ ) {
         mp.ProcessLine( buffer->GetItem( i ) );
@@ -297,6 +337,8 @@ void ParseLineBuffer( const PLineBuffer & buffer ) {
             }
         }
     }
+
+    //std::cout << buffer->GetTimestamp() << " end parse" << std::endl;
 
 }
 
@@ -351,7 +393,7 @@ void OutputStats( const std::stop_token & stoken ) {
     }
 }
 
-void Aggregate( std::stop_token stoken ) {
+void Aggregate( const std::stop_token & stoken ) {
 
     while ( true ) {
 
@@ -389,7 +431,7 @@ void Aggregate( std::stop_token stoken ) {
 
 }
 
-void ProcessLineBuffers( std::stop_token stoken ) {
+void ProcessLineBuffers( const std::stop_token & stoken ) {
     while ( true ) {
         {
             std::unique_lock< std::mutex > lock( line_buffers_mutex );
@@ -425,16 +467,13 @@ void ProcessLineBuffers( std::stop_token stoken ) {
 
 void FlushLineBuffer() {
     if ( current_line_buffer ) {
-        {
-            std::lock_guard < std::mutex > lock( line_buffers_mutex );
-            line_buffers.push( current_line_buffer );
-            line_buffers_available.notify_one();
-        }
-        //ProcessLineBuffers();
+        std::lock_guard < std::mutex > lock( line_buffers_mutex );
+        line_buffers.push( current_line_buffer );
+        line_buffers_available.notify_one();
     }
 }
 
-void ReadSTDIN( std::stop_token stoken ) {
+void ReadSTDIN( const std::stop_token & stoken ) {
 
     bool bPrevEmptyLine = false;
     while ( std::cin.good() && !stoken.stop_requested() ) {
@@ -457,13 +496,25 @@ void ReadSTDIN( std::stop_token stoken ) {
 
 }
 
+void Cleanup( const std::stop_token & stoken ) {
+    while ( !stoken.stop_requested() ) {
+        std::this_thread::sleep_for( std::chrono::seconds( 1 ) );
+        request_map.DiscardOlderThan( time( nullptr ) - REQUEST_LIFETIME_IN_SECONDS );
+    }
+}
+
 int main() {
 
     auto read_thread = std::jthread( ReadSTDIN );
+    auto cleanup_thread = std::jthread( Cleanup );
     auto parse_thread = std::jthread( ProcessLineBuffers );
     auto aggregate_thread = std::jthread( Aggregate );
     auto output_thread = std::jthread( OutputStats );
+
     read_thread.join();
+
+    cleanup_thread.request_stop();
+    cleanup_thread.join();
     parse_thread.request_stop();
     parse_thread.join();
     aggregate_thread.request_stop();
