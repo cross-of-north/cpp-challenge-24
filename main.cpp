@@ -1,4 +1,4 @@
-#include <deque>
+#include <condition_variable>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -7,10 +7,12 @@
 #include <ranges>
 #include <set>
 #include <shared_mutex>
+#include <thread>
 #include <vector>
 
 constexpr time_t SECONDS_PER_LINE_BUFFER = 1;
 constexpr time_t SECONDS_PER_EVENT_BUFFER = 1;
+constexpr time_t SECONDS_PER_OUTPUT = 5;
 
 class CLineBuffer {
 
@@ -167,6 +169,11 @@ class CEventBuffers {
             }
             return !!event_buffer;
         }
+
+        bool IsEmpty() const {
+            std::shared_lock < std::shared_mutex > lock( m_mutex );
+            return m_event_buffers.empty();
+        }
 };
 
 class CMessageProcessor {
@@ -264,6 +271,16 @@ CEventBuffers response_map;
 t_string_to_string_to_uint64_map result_map;
 t_line_buffers line_buffers;
 std::mutex line_buffers_mutex;
+std::condition_variable line_buffers_available;
+std::mutex response_buffers_mutex;
+std::condition_variable response_buffers_available;
+std::mutex result_map_mutex;
+/*
+typedef std::queue< std::future< void > > t_parse_futures;
+t_parse_futures parse_futures;
+typedef std::queue< std::future< void > > t_aggregate_futures;
+t_aggregate_futures aggregate_futures;
+*/
 
 PLineBuffer current_line_buffer;
 
@@ -283,41 +300,127 @@ void ParseLineBuffer( const PLineBuffer & buffer ) {
 
 }
 
-void Aggregate() {
-    PEventBuffer buffer;
-    while ( response_map.PopBuffer( buffer ) ) {
-        std::string id;
-        time_t result_ts = 0;
-        std::string result_code;
-        while ( buffer->Pop( id, result_code, result_ts ) ) {
-            time_t ts = 0;
-            std::string request;
-            if ( request_map.GetByID( id, request, ts ) ) {
-                result_map[ request ][ result_code ]++;
-            } else {
-                result_map[ "undefined" ][ result_code ]++;
+void OutputStats( const std::stop_token & stoken ) {
+
+    time_t prev_time = time( nullptr ) / SECONDS_PER_OUTPUT;
+    bool bHadOutput = false;
+
+    while ( true ) {
+
+        std::this_thread::sleep_for( std::chrono::milliseconds( 100 ) );
+
+        time_t now = time( nullptr ) / SECONDS_PER_OUTPUT;
+
+        if ( now > prev_time || ( stoken.stop_requested() && !bHadOutput ) ) {
+
+            bHadOutput = true;
+
+            prev_time = now;
+
+            std::lock_guard < std::mutex > lock( result_map_mutex );
+
+            std::set < std::string > result_codes;
+            for ( const auto & stats : std::views::values( result_map ) ) {
+                const auto & request_result_codes = std::views::keys( stats );
+                result_codes.insert( request_result_codes.begin(), request_result_codes.end() );
             }
+
+            const char * csv_separator = ";";//"\t";
+
+            std::cout << "request";
+            for ( const auto & result_code : result_codes ) {
+                std::cout << csv_separator << result_code;
+            }
+            for ( auto & [ request, stats ] : result_map ) {
+                std::cout << std::endl;
+                std::cout << request;
+                for ( const auto & result_code : result_codes ) {
+                    std::cout << csv_separator << stats[ result_code ];
+                }
+            }
+
+            std::cout << std::endl;
+
+            result_map.clear();
         }
+
+        if ( stoken.stop_requested() ) {
+            break;
+        }
+
     }
 }
 
-void ProcessLineBuffers() {
-    bool bDone = false;
-    do {
-        PLineBuffer buffer;
+void Aggregate( std::stop_token stoken ) {
+
+    while ( true ) {
+
         {
-            std::lock_guard < std::mutex > lock( line_buffers_mutex );
-            if ( line_buffers.empty() ) {
-                bDone = true;
-            } else {
-                buffer = line_buffers.front();
-                line_buffers.pop();
+            std::unique_lock< std::mutex > lock( response_buffers_mutex );
+            response_buffers_available.wait_for( lock, std::chrono::milliseconds( 100 ) );
+        }
+
+        if ( stoken.stop_requested() && response_map.IsEmpty() ) {
+            break;
+        }
+
+        PEventBuffer buffer;
+        while ( response_map.PopBuffer( buffer ) ) {
+            std::string id;
+            time_t result_ts = 0;
+            std::string result_code;
+            std::lock_guard < std::mutex > lock( result_map_mutex );
+            while ( buffer->Pop( id, result_code, result_ts ) ) {
+                time_t ts = 0;
+                std::string request;
+                if ( request_map.GetByID( id, request, ts ) ) {
+                    result_map[ request ][ result_code ]++;
+                } else {
+                    result_map[ "undefined" ][ result_code ]++;
+                }
             }
         }
-        if ( buffer ) {
-            ParseLineBuffer( buffer );
+
+        if ( stoken.stop_requested() ) {
+            break;
         }
-    } while( !bDone );
+
+    }
+
+}
+
+void ProcessLineBuffers( std::stop_token stoken ) {
+    while ( true ) {
+        {
+            std::unique_lock< std::mutex > lock( line_buffers_mutex );
+            line_buffers_available.wait_for( lock, std::chrono::milliseconds( 100 ) );
+        }
+
+        if ( stoken.stop_requested() ) {
+            std::lock_guard < std::mutex > lock( line_buffers_mutex );
+            if ( line_buffers.empty() ) {
+                break;
+            }
+        }
+
+        PLineBuffer buffer;
+        do {
+            {
+                std::lock_guard < std::mutex > lock( line_buffers_mutex );
+                if ( line_buffers.empty() ) {
+                    buffer.reset();
+                } else {
+                    buffer = line_buffers.front();
+                    line_buffers.pop();
+                }
+            }
+            if ( buffer ) {
+                ParseLineBuffer( buffer );
+                std::lock_guard < std::mutex > lock( response_buffers_mutex );
+                response_buffers_available.notify_one();
+            }
+        } while ( buffer );
+    }
 }
 
 void FlushLineBuffer() {
@@ -325,15 +428,16 @@ void FlushLineBuffer() {
         {
             std::lock_guard < std::mutex > lock( line_buffers_mutex );
             line_buffers.push( current_line_buffer );
+            line_buffers_available.notify_one();
         }
-        ProcessLineBuffers();
+        //ProcessLineBuffers();
     }
 }
 
-void ReadSTDIN() {
+void ReadSTDIN( std::stop_token stoken ) {
 
     bool bPrevEmptyLine = false;
-    while ( std::cin.good() ) {
+    while ( std::cin.good() && !stoken.stop_requested() ) {
         std::string input;
         std::getline( std::cin, input );
         if (
@@ -353,37 +457,21 @@ void ReadSTDIN() {
 
 }
 
-void OutputStats() {
-
-    std::set < std::string > result_codes;
-    for ( const auto & stats : std::views::values( result_map ) ) {
-        const auto & request_result_codes = std::views::keys( stats );
-        result_codes.insert( request_result_codes.begin(), request_result_codes.end() );
-    }
-
-    const char * csv_separator = ";";//"\t";
-
-    std::cout << "request";
-    for ( const auto & result_code : result_codes ) {
-        std::cout << csv_separator << result_code;
-    }
-    for ( auto & [ request, stats ] : result_map ) {
-        std::cout << std::endl;
-        std::cout << request;
-        for ( const auto & result_code : result_codes ) {
-            std::cout << csv_separator << stats[ result_code ];
-        }
-    }
-
-}
-
 int main() {
 
-    ReadSTDIN();
+    auto read_thread = std::jthread( ReadSTDIN );
+    auto parse_thread = std::jthread( ProcessLineBuffers );
+    auto aggregate_thread = std::jthread( Aggregate );
+    auto output_thread = std::jthread( OutputStats );
+    read_thread.join();
+    parse_thread.request_stop();
+    parse_thread.join();
+    aggregate_thread.request_stop();
+    aggregate_thread.join();
+    output_thread.request_stop();
+    output_thread.join();
 
-    Aggregate();
-
-    OutputStats();
+    //OutputStats();
 
     return 0;
 }
