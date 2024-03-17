@@ -12,7 +12,7 @@
 
 constexpr time_t SECONDS_PER_LINE_BUFFER = 1;
 constexpr time_t SECONDS_PER_EVENT_BUFFER = 1;
-constexpr time_t SECONDS_PER_OUTPUT = 5;
+constexpr time_t SECONDS_PER_OUTPUT = 1;
 constexpr time_t REQUEST_LIFETIME_IN_SECONDS = 5;
 
 //#define DEBUG_MEMORY_CONSUMPTION 1
@@ -147,6 +147,18 @@ class CEventBuffers {
             }
         }
 
+        bool GetTop( PEventBuffer & event_buffer, time_t & ts ) const {
+            event_buffer.reset();
+            ts = 0;
+            std::shared_lock < std::shared_mutex > lock( m_mutex );
+            auto it = m_event_buffers.begin();
+            if ( it != m_event_buffers.end() ) {
+                ts = it->first;
+                event_buffer = it->second;
+            }
+            return !!event_buffer;
+        }
+
     public:
 
         void Push( const time_t ts, const std::string & id, const std::string & s ) {
@@ -184,15 +196,24 @@ class CEventBuffers {
             return bResult;
         }
 
-        bool PopBuffer( PEventBuffer & event_buffer ) {
-            event_buffer.reset();
+        bool GetTopBuffer( PEventBuffer & event_buffer ) const {
+            time_t ts = 0;
+            return GetTop( event_buffer, ts );
+        }
+
+        bool GetTopTimestamp( time_t & ts ) const {
+            PEventBuffer event_buffer;
+            return GetTop( event_buffer, ts );
+        }
+
+        void RemoveBuffer( const PEventBuffer & event_buffer ) {
             std::unique_lock < std::shared_mutex > lock( m_mutex );
-            auto it = m_event_buffers.begin();
-            if ( it != m_event_buffers.end() ) {
-                event_buffer = it->second;
-                m_event_buffers.erase( it );
+            for ( auto it = m_event_buffers.begin(); it != m_event_buffers.end(); ) {
+                if ( it->second == event_buffer ) {
+                    m_event_buffers.erase( it );
+                    break;
+                }
             }
-            return !!event_buffer;
         }
 
         bool IsEmpty() const {
@@ -351,39 +372,66 @@ void OutputStats( const std::stop_token & stoken ) {
 
         std::this_thread::sleep_for( std::chrono::milliseconds( 100 ) );
 
-        time_t now = time( nullptr ) / SECONDS_PER_OUTPUT;
+        time_t now = time( nullptr );
+        time_t current_time = now / SECONDS_PER_OUTPUT;
+        now = current_time * SECONDS_PER_OUTPUT;
 
-        if ( now > prev_time || ( stoken.stop_requested() && !bHadOutput ) ) {
+        if ( current_time > prev_time || ( stoken.stop_requested() && !bHadOutput ) ) {
 
-            bHadOutput = true;
+            bool bShouldWait = false;
 
-            prev_time = now;
-
-            std::lock_guard < std::mutex > lock( result_map_mutex );
-
-            std::set < std::string > result_codes;
-            for ( const auto & stats : std::views::values( result_map ) ) {
-                const auto & request_result_codes = std::views::keys( stats );
-                result_codes.insert( request_result_codes.begin(), request_result_codes.end() );
-            }
-
-            const char * csv_separator = ";";//"\t";
-
-            std::cout << "request";
-            for ( const auto & result_code : result_codes ) {
-                std::cout << csv_separator << result_code;
-            }
-            for ( auto & [ request, stats ] : result_map ) {
-                std::cout << std::endl;
-                std::cout << request;
-                for ( const auto & result_code : result_codes ) {
-                    std::cout << csv_separator << stats[ result_code ];
+            {
+                std::unique_lock < std::mutex > lock( line_buffers_mutex );
+                if ( line_buffers.empty() ) {
+                    //std::cout << "No unparsed line buffers" << std::endl;
+                } else {
+                    PLineBuffer buffer = line_buffers.front();
+                    if ( buffer->GetTimestamp() < now ) {
+                        //std::cout << "Waiting for unparsed line buffer at " << buffer->GetTimestamp() - now << " seconds with " << buffer->GetCount() << " lines" << std::endl;
+                        bShouldWait = true;
+                    }
                 }
             }
 
-            std::cout << std::endl;
+            {
+                time_t ts = 0;
+                if ( response_map.GetTopTimestamp( ts ) && ts < now ) {
+                    //std::cout << "Waiting for unparsed response buffer at " << ts - now << " seconds" << std::endl;
+                    bShouldWait = true;
+                }
+            }
 
-            result_map.clear();
+            if ( !bShouldWait ) {
+                bHadOutput = true;
+
+                prev_time = current_time;
+
+                std::lock_guard < std::mutex > lock( result_map_mutex );
+
+                std::set < std::string > result_codes;
+                for ( const auto & stats : std::views::values( result_map ) ) {
+                    const auto & request_result_codes = std::views::keys( stats );
+                    result_codes.insert( request_result_codes.begin(), request_result_codes.end() );
+                }
+
+                const char * csv_separator = ";";//"\t";
+
+                std::cout << "request";
+                for ( const auto & result_code : result_codes ) {
+                    std::cout << csv_separator << result_code;
+                }
+                for ( auto & [ request, stats ] : result_map ) {
+                    std::cout << std::endl;
+                    std::cout << request;
+                    for ( const auto & result_code : result_codes ) {
+                        std::cout << csv_separator << stats[ result_code ];
+                    }
+                }
+
+                std::cout << std::endl;
+
+                result_map.clear();
+            }
         }
 
         if ( stoken.stop_requested() ) {
@@ -406,21 +454,26 @@ void Aggregate( const std::stop_token & stoken ) {
             break;
         }
 
+        //std::this_thread::sleep_for( std::chrono::seconds( 2 ) );
+
         PEventBuffer buffer;
-        while ( response_map.PopBuffer( buffer ) ) {
+        while ( response_map.GetTopBuffer( buffer ) ) {
             std::string id;
             time_t result_ts = 0;
             std::string result_code;
-            std::lock_guard < std::mutex > lock( result_map_mutex );
-            while ( buffer->Pop( id, result_code, result_ts ) ) {
-                time_t ts = 0;
-                std::string request;
-                if ( request_map.GetByID( id, request, ts ) ) {
-                    result_map[ request ][ result_code ]++;
-                } else {
-                    result_map[ "undefined" ][ result_code ]++;
+            {
+                std::lock_guard < std::mutex > lock( result_map_mutex );
+                while ( buffer->Pop( id, result_code, result_ts ) ) {
+                    time_t ts = 0;
+                    std::string request;
+                    if ( request_map.GetByID( id, request, ts ) ) {
+                        result_map[ request ][ result_code ]++;
+                    } else {
+                        result_map[ "undefined" ][ result_code ]++;
+                    }
                 }
             }
+            response_map.RemoveBuffer( buffer );
         }
 
         if ( stoken.stop_requested() ) {
@@ -438,6 +491,8 @@ void ProcessLineBuffers( const std::stop_token & stoken ) {
             line_buffers_available.wait_for( lock, std::chrono::milliseconds( 100 ) );
         }
 
+        //std::this_thread::sleep_for( std::chrono::seconds( 2 ) );
+
         if ( stoken.stop_requested() ) {
             std::lock_guard < std::mutex > lock( line_buffers_mutex );
             if ( line_buffers.empty() ) {
@@ -453,13 +508,18 @@ void ProcessLineBuffers( const std::stop_token & stoken ) {
                     buffer.reset();
                 } else {
                     buffer = line_buffers.front();
-                    line_buffers.pop();
                 }
             }
             if ( buffer ) {
                 ParseLineBuffer( buffer );
-                std::lock_guard < std::mutex > lock( response_buffers_mutex );
-                response_buffers_available.notify_one();
+                {
+                    std::lock_guard < std::mutex > lock( response_buffers_mutex );
+                    response_buffers_available.notify_one();
+                }
+                {
+                    std::lock_guard < std::mutex > lock( line_buffers_mutex );
+                    line_buffers.pop();
+                }
             }
         } while ( buffer );
     }
