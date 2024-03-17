@@ -57,7 +57,6 @@ class CLineBuffer {
         }
 };
 typedef std::shared_ptr < CLineBuffer > PLineBuffer;
-typedef std::queue< PLineBuffer > t_line_buffers;
 
 class CEventBuffer {
 
@@ -121,60 +120,130 @@ class CEventBuffer {
 
 };
 typedef std::shared_ptr < CEventBuffer > PEventBuffer;
-typedef std::map < time_t, PEventBuffer > t_event_buffers;
 
-class CEventBuffers {
+template < typename T > class CTimeKeyedCollection {
 
-    private:
+    public:
 
-        t_event_buffers m_event_buffers;
-        mutable std::shared_mutex m_mutex;
+        typedef std::shared_ptr < T > PT;
+        typedef PT t_item;
+        typedef std::map < time_t, PT > t_container;
 
     protected:
 
-        void GetBuffer( const time_t time_key, PEventBuffer & event_buffer, const bool bCanAdd ) {
-            event_buffer.reset();
+        t_container m_container;
+        mutable std::shared_mutex m_mutex;
+        std::mutex m_new_data_mutex;
+        std::condition_variable m_new_data_available;
+
+        void DoGetItemByKey( const time_t time_key, PT & item, const bool bCanAdd ) {
+            item.reset();
             if (
-                auto it = m_event_buffers.find( time_key );
-                it == m_event_buffers.end()
+                auto it = m_container.find( time_key );
+                it == m_container.end()
             ) {
                 if ( bCanAdd ) {
-                    event_buffer = std::make_shared < CEventBuffer >();
-                    m_event_buffers.emplace( std::make_pair( time_key, event_buffer ) );
+                    item = std::make_shared < T >();
+                    m_container.emplace( std::make_pair( time_key, item ) );
                 }
             } else {
-                event_buffer = it->second;
+                item = it->second;
             }
         }
 
-        bool GetTop( PEventBuffer & event_buffer, time_t & ts ) const {
-            event_buffer.reset();
+        bool DoGetTopItem( PT & item, time_t & ts ) const {
+            item.reset();
             ts = 0;
             std::shared_lock < std::shared_mutex > lock( m_mutex );
-            auto it = m_event_buffers.begin();
-            if ( it != m_event_buffers.end() ) {
+            auto it = m_container.begin();
+            if ( it != m_container.end() ) {
                 ts = it->first;
-                event_buffer = it->second;
+                item = it->second;
             }
-            return !!event_buffer;
+            return !!item;
         }
+
+    public:
+
+        void GetItemByKey( const time_t ts, PT & item ) {
+            {
+                bool bCanAdd = false;
+                std::shared_lock < std::shared_mutex > lock( m_mutex );
+                DoGetItemByKey( ts, item, bCanAdd );
+            }
+            if ( !item ) {
+                // need to add?
+                bool bCanAdd = true;
+                std::unique_lock < std::shared_mutex > lock( m_mutex );
+                DoGetItemByKey( ts, item, bCanAdd );
+            }
+        }
+
+        bool GetTopItem( PT & item ) const {
+            time_t ts = 0;
+            return DoGetTopItem( item, ts );
+        }
+
+        bool GetTopTimestamp( time_t & ts ) const {
+            PT item;
+            return DoGetTopItem( item, ts );
+        }
+
+        void RemoveItem( const PT & item ) {
+            std::unique_lock < std::shared_mutex > lock( m_mutex );
+            for ( auto it = m_container.begin(); it != m_container.end(); ) {
+                if ( it->second == item ) {
+                    m_container.erase( it );
+                    break;
+                }
+            }
+        }
+
+        bool IsEmpty() const {
+            std::shared_lock < std::shared_mutex > lock( m_mutex );
+            return m_container.empty();
+        }
+
+        void DiscardOlderThan( const time_t min_ts ) {
+            std::unique_lock < std::shared_mutex > lock( m_mutex );
+            for ( auto it = m_container.begin(); it != m_container.end(); ) {
+                if ( it->first < min_ts ) {
+                    it = m_container.erase( it );
+                } else {
+                    //++it;
+                    break;
+                }
+            }
+        }
+
+        auto WaitForData( const int timeout_ms ) {
+            std::unique_lock< std::mutex > lock( m_new_data_mutex );
+            return m_new_data_available.wait_for( lock, std::chrono::milliseconds( timeout_ms ) );
+        }
+
+        void NotifyDataAvailable() {
+            std::lock_guard < std::mutex > lock( m_new_data_mutex );
+            m_new_data_available.notify_one();
+        }
+
+        void AddItem( const time_t ts, const PT & item ) {
+            std::unique_lock < std::shared_mutex > lock( m_mutex );
+            m_container.emplace( std::make_pair( ts, item ) );
+        }
+
+};
+
+class CLineBuffers : public CTimeKeyedCollection < CLineBuffer > {
+};
+
+class CEventBuffers : public CTimeKeyedCollection < CEventBuffer > {
 
     public:
 
         void Push( const time_t ts, const std::string & id, const std::string & s ) {
             time_t time_key = ts / SECONDS_PER_EVENT_BUFFER;
             PEventBuffer event_buffer;
-            {
-                bool bCanAdd = false;
-                std::shared_lock < std::shared_mutex > lock( m_mutex );
-                GetBuffer( time_key, event_buffer, bCanAdd );
-            }
-            if ( !event_buffer ) {
-                // need to add?
-                bool bCanAdd = true;
-                std::unique_lock < std::shared_mutex > lock( m_mutex );
-                GetBuffer( time_key, event_buffer, bCanAdd );
-            }
+            GetItemByKey( time_key, event_buffer );
             if ( event_buffer ) {
                 event_buffer->Push( ts, id, s );
             } else {
@@ -187,50 +256,13 @@ class CEventBuffers {
             value.clear();
             ts = 0;
             std::shared_lock < std::shared_mutex > lock( m_mutex );
-            for ( const auto & [ buffer_timestamp, buffer ] : std::ranges::reverse_view( m_event_buffers ) ) {
+            for ( const auto & [ buffer_timestamp, buffer ] : std::ranges::reverse_view( m_container ) ) {
                 if ( buffer->GetByID( id, value, ts ) ) {
                     bResult = true;
                     break;
                 }
             }
             return bResult;
-        }
-
-        bool GetTopBuffer( PEventBuffer & event_buffer ) const {
-            time_t ts = 0;
-            return GetTop( event_buffer, ts );
-        }
-
-        bool GetTopTimestamp( time_t & ts ) const {
-            PEventBuffer event_buffer;
-            return GetTop( event_buffer, ts );
-        }
-
-        void RemoveBuffer( const PEventBuffer & event_buffer ) {
-            std::unique_lock < std::shared_mutex > lock( m_mutex );
-            for ( auto it = m_event_buffers.begin(); it != m_event_buffers.end(); ) {
-                if ( it->second == event_buffer ) {
-                    m_event_buffers.erase( it );
-                    break;
-                }
-            }
-        }
-
-        bool IsEmpty() const {
-            std::shared_lock < std::shared_mutex > lock( m_mutex );
-            return m_event_buffers.empty();
-        }
-
-        void DiscardOlderThan( const time_t min_ts ) {
-            std::unique_lock < std::shared_mutex > lock( m_mutex );
-            for ( auto it = m_event_buffers.begin(); it != m_event_buffers.end(); ) {
-                if ( it->first < min_ts ) {
-                    it = m_event_buffers.erase( it );
-                } else {
-                    //++it;
-                    break;
-                }
-            }
         }
 
 };
@@ -320,26 +352,37 @@ class CMessageProcessor {
         }
 };
 
-typedef std::map < std::string, std::string > t_string_to_string_map;
-typedef std::map < std::string, long long unsigned int > t_string_to_uint64_map;
-typedef std::map < std::string, t_string_to_uint64_map > t_string_to_string_to_uint64_map;
+class CAggregateStats {
+    public:
+        typedef std::map < std::string, std::string > t_string_to_string_map;
+        typedef std::map < std::string, long long unsigned int > t_string_to_uint64_map;
+        typedef std::map < std::string, t_string_to_uint64_map > t_aggregate_stats;
+    protected:
+        std::mutex m_mutex;
+        t_aggregate_stats m_stats;
+    public:
+        std::mutex & GetMutex() {
+            return m_mutex;
+        }
+
+
+        t_aggregate_stats & GetStats() {
+            return m_stats;
+        }
+};
+
+class CAggregateStatsCollection : public CTimeKeyedCollection < CAggregateStats > {
+    public:
+        static time_t GetQuantizedTime( const time_t ts ) {
+            return ( ts / SECONDS_PER_OUTPUT ) * SECONDS_PER_OUTPUT;
+        }
+};
 
 CMessageProcessor mp;
 CEventBuffers request_map;
 CEventBuffers response_map;
-t_string_to_string_to_uint64_map result_map;
-t_line_buffers line_buffers;
-std::mutex line_buffers_mutex;
-std::condition_variable line_buffers_available;
-std::mutex response_buffers_mutex;
-std::condition_variable response_buffers_available;
-std::mutex result_map_mutex;
-/*
-typedef std::queue< std::future< void > > t_parse_futures;
-t_parse_futures parse_futures;
-typedef std::queue< std::future< void > > t_aggregate_futures;
-t_aggregate_futures aggregate_futures;
-*/
+CLineBuffers line_buffers;
+CAggregateStatsCollection stats;
 
 PLineBuffer current_line_buffer;
 
@@ -365,38 +408,31 @@ void ParseLineBuffer( const PLineBuffer & buffer ) {
 
 void OutputStats( const std::stop_token & stoken ) {
 
-    time_t prev_time = time( nullptr ) / SECONDS_PER_OUTPUT;
+    time_t prev_time = CAggregateStatsCollection::GetQuantizedTime( time( nullptr ) );
     bool bHadOutput = false;
 
     while ( true ) {
 
         std::this_thread::sleep_for( std::chrono::milliseconds( 100 ) );
 
-        time_t now = time( nullptr );
-        time_t current_time = now / SECONDS_PER_OUTPUT;
-        now = current_time * SECONDS_PER_OUTPUT;
+        time_t current_time = CAggregateStatsCollection::GetQuantizedTime( time( nullptr ) );
 
         if ( current_time > prev_time || ( stoken.stop_requested() && !bHadOutput ) ) {
 
             bool bShouldWait = false;
 
             {
-                std::unique_lock < std::mutex > lock( line_buffers_mutex );
-                if ( line_buffers.empty() ) {
-                    //std::cout << "No unparsed line buffers" << std::endl;
-                } else {
-                    PLineBuffer buffer = line_buffers.front();
-                    if ( buffer->GetTimestamp() < now ) {
-                        //std::cout << "Waiting for unparsed line buffer at " << buffer->GetTimestamp() - now << " seconds with " << buffer->GetCount() << " lines" << std::endl;
-                        bShouldWait = true;
-                    }
+                time_t ts = 0;
+                if ( line_buffers.GetTopTimestamp( ts ) && ts < current_time ) {
+                    //std::cout << "Waiting for unparsed line buffer at " << ts - current_time << " seconds" << std::endl;
+                    bShouldWait = true;
                 }
             }
 
             {
                 time_t ts = 0;
-                if ( response_map.GetTopTimestamp( ts ) && ts < now ) {
-                    //std::cout << "Waiting for unparsed response buffer at " << ts - now << " seconds" << std::endl;
+                if ( response_map.GetTopTimestamp( ts ) && ts < current_time ) {
+                    //std::cout << "Waiting for unparsed response buffer at " << ts - current_time << " seconds" << std::endl;
                     bShouldWait = true;
                 }
             }
@@ -406,7 +442,10 @@ void OutputStats( const std::stop_token & stoken ) {
 
                 prev_time = current_time;
 
-                std::lock_guard < std::mutex > lock( result_map_mutex );
+                CAggregateStatsCollection::t_item stats_item;
+                stats.GetItemByKey( current_time, stats_item );
+                std::lock_guard < std::mutex > lock( stats_item->GetMutex() );
+                auto result_map = stats_item->GetStats();
 
                 std::set < std::string > result_codes;
                 for ( const auto & stats : std::views::values( result_map ) ) {
@@ -430,7 +469,7 @@ void OutputStats( const std::stop_token & stoken ) {
 
                 std::cout << std::endl;
 
-                result_map.clear();
+                stats.RemoveItem( stats_item );
             }
         }
 
@@ -445,10 +484,7 @@ void Aggregate( const std::stop_token & stoken ) {
 
     while ( true ) {
 
-        {
-            std::unique_lock< std::mutex > lock( response_buffers_mutex );
-            response_buffers_available.wait_for( lock, std::chrono::milliseconds( 100 ) );
-        }
+        response_map.WaitForData( 100 );
 
         if ( stoken.stop_requested() && response_map.IsEmpty() ) {
             break;
@@ -457,11 +493,20 @@ void Aggregate( const std::stop_token & stoken ) {
         //std::this_thread::sleep_for( std::chrono::seconds( 2 ) );
 
         PEventBuffer buffer;
-        while ( response_map.GetTopBuffer( buffer ) ) {
-            std::string id;
-            time_t result_ts = 0;
-            std::string result_code;
+        while ( response_map.GetTopItem( buffer ) ) {
             {
+                std::string id;
+                time_t result_ts = 0;
+                std::string result_code;
+
+                time_t stats_time = CAggregateStatsCollection::GetQuantizedTime( buffer->GetTimestamp() );
+
+                CAggregateStatsCollection::t_item stats_item;
+                stats.GetItemByKey( current_time, stats_item );
+                std::lock_guard < std::mutex > lock( stats_item->GetMutex() );
+                auto result_map = stats_item->GetStats();
+
+
                 std::lock_guard < std::mutex > lock( result_map_mutex );
                 while ( buffer->Pop( id, result_code, result_ts ) ) {
                     time_t ts = 0;
@@ -473,11 +518,7 @@ void Aggregate( const std::stop_token & stoken ) {
                     }
                 }
             }
-            response_map.RemoveBuffer( buffer );
-        }
-
-        if ( stoken.stop_requested() ) {
-            break;
+            response_map.RemoveItem( buffer );
         }
 
     }
@@ -485,51 +526,31 @@ void Aggregate( const std::stop_token & stoken ) {
 }
 
 void ProcessLineBuffers( const std::stop_token & stoken ) {
+
     while ( true ) {
-        {
-            std::unique_lock< std::mutex > lock( line_buffers_mutex );
-            line_buffers_available.wait_for( lock, std::chrono::milliseconds( 100 ) );
-        }
+
+        line_buffers.WaitForData( 100 );
 
         //std::this_thread::sleep_for( std::chrono::seconds( 2 ) );
 
-        if ( stoken.stop_requested() ) {
-            std::lock_guard < std::mutex > lock( line_buffers_mutex );
-            if ( line_buffers.empty() ) {
-                break;
-            }
+        if ( stoken.stop_requested() && line_buffers.IsEmpty() ) {
+            break;
         }
 
         PLineBuffer buffer;
-        do {
-            {
-                std::lock_guard < std::mutex > lock( line_buffers_mutex );
-                if ( line_buffers.empty() ) {
-                    buffer.reset();
-                } else {
-                    buffer = line_buffers.front();
-                }
-            }
-            if ( buffer ) {
-                ParseLineBuffer( buffer );
-                {
-                    std::lock_guard < std::mutex > lock( response_buffers_mutex );
-                    response_buffers_available.notify_one();
-                }
-                {
-                    std::lock_guard < std::mutex > lock( line_buffers_mutex );
-                    line_buffers.pop();
-                }
-            }
-        } while ( buffer );
+
+        while ( line_buffers.GetTopItem( buffer ) ) {
+            ParseLineBuffer( buffer );
+            response_map.NotifyDataAvailable();
+            line_buffers.RemoveItem( buffer );
+        }
     }
 }
 
 void FlushLineBuffer() {
     if ( current_line_buffer ) {
-        std::lock_guard < std::mutex > lock( line_buffers_mutex );
-        line_buffers.push( current_line_buffer );
-        line_buffers_available.notify_one();
+        line_buffers.AddItem( current_line_buffer->GetTimestamp(), current_line_buffer );
+        line_buffers.NotifyDataAvailable();
     }
 }
 
