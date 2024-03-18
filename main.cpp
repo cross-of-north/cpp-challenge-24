@@ -12,8 +12,8 @@
 
 constexpr time_t SECONDS_PER_LINE_BUFFER = 1;
 constexpr time_t SECONDS_PER_EVENT_BUFFER = 1;
-constexpr time_t SECONDS_PER_OUTPUT = 1;
-constexpr time_t REQUEST_LIFETIME_IN_SECONDS = 5;
+constexpr time_t SECONDS_PER_OUTPUT = 5;
+constexpr time_t REQUEST_LIFETIME_IN_SECONDS = 10;
 
 //#define DEBUG_MEMORY_CONSUMPTION 1
 
@@ -151,18 +151,6 @@ template < typename T > class CTimeKeyedCollection {
             }
         }
 
-        bool DoGetTopItem( PT & item, time_t & ts ) const {
-            item.reset();
-            ts = 0;
-            std::shared_lock < std::shared_mutex > lock( m_mutex );
-            auto it = m_container.begin();
-            if ( it != m_container.end() ) {
-                ts = it->first;
-                item = it->second;
-            }
-            return !!item;
-        }
-
     public:
 
         void GetItemByKey( const time_t ts, PT & item ) {
@@ -179,14 +167,48 @@ template < typename T > class CTimeKeyedCollection {
             }
         }
 
+        bool GetTop( PT & item, time_t & ts ) const {
+            item.reset();
+            ts = 0;
+            std::shared_lock < std::shared_mutex > lock( m_mutex );
+            auto it = m_container.begin();
+            if ( it != m_container.end() ) {
+                ts = it->first;
+                item = it->second;
+            }
+            return !!item;
+        }
+
+        bool GetBottom( PT & item, time_t & ts ) const {
+            item.reset();
+            ts = 0;
+            std::shared_lock < std::shared_mutex > lock( m_mutex );
+            auto it = m_container.rbegin();
+            if ( it != m_container.rend() ) {
+                ts = it->first;
+                item = it->second;
+            }
+            return !!item;
+        }
+
         bool GetTopItem( PT & item ) const {
             time_t ts = 0;
-            return DoGetTopItem( item, ts );
+            return GetTop( item, ts );
         }
 
         bool GetTopTimestamp( time_t & ts ) const {
             PT item;
-            return DoGetTopItem( item, ts );
+            return GetTop( item, ts );
+        }
+
+        bool GetBottomItem( PT & item ) const {
+            time_t ts = 0;
+            return GetBottom( item, ts );
+        }
+
+        bool GetBottomTimestamp( time_t & ts ) const {
+            PT item;
+            return GetBottom( item, ts );
         }
 
         void RemoveItem( const PT & item ) {
@@ -195,6 +217,8 @@ template < typename T > class CTimeKeyedCollection {
                 if ( it->second == item ) {
                     m_container.erase( it );
                     break;
+                } else {
+                    ++it;
                 }
             }
         }
@@ -361,15 +385,16 @@ class CAggregateStats {
         std::mutex m_mutex;
         t_aggregate_stats m_stats;
     public:
+
         std::mutex & GetMutex() {
             return m_mutex;
         }
-
 
         t_aggregate_stats & GetStats() {
             return m_stats;
         }
 };
+typedef std::shared_ptr < CAggregateStats > PAggregateStats;
 
 class CAggregateStatsCollection : public CTimeKeyedCollection < CAggregateStats > {
     public:
@@ -408,7 +433,6 @@ void ParseLineBuffer( const PLineBuffer & buffer ) {
 
 void OutputStats( const std::stop_token & stoken ) {
 
-    time_t prev_time = CAggregateStatsCollection::GetQuantizedTime( time( nullptr ) );
     bool bHadOutput = false;
 
     while ( true ) {
@@ -417,33 +441,29 @@ void OutputStats( const std::stop_token & stoken ) {
 
         time_t current_time = CAggregateStatsCollection::GetQuantizedTime( time( nullptr ) );
 
-        if ( current_time > prev_time || ( stoken.stop_requested() && !bHadOutput ) ) {
+        PAggregateStats stats_item;
+        time_t bottom_ts = 0;
+        while (
+            ( stats.GetBottom( stats_item, bottom_ts ) && bottom_ts < current_time )
+            ||
+            ( stoken.stop_requested() && !bHadOutput )
+        ) {
 
             bool bShouldWait = false;
 
-            {
-                time_t ts = 0;
-                if ( line_buffers.GetTopTimestamp( ts ) && ts < current_time ) {
-                    //std::cout << "Waiting for unparsed line buffer at " << ts - current_time << " seconds" << std::endl;
-                    bShouldWait = true;
-                }
+            if ( time_t ts = 0; line_buffers.GetTopTimestamp( ts ) && ts <= bottom_ts ) {
+                std::cout << "Waiting for unparsed line buffer at " << ts - bottom_ts << " seconds" << std::endl;
+                bShouldWait = true;
             }
 
-            {
-                time_t ts = 0;
-                if ( response_map.GetTopTimestamp( ts ) && ts < current_time ) {
-                    //std::cout << "Waiting for unparsed response buffer at " << ts - current_time << " seconds" << std::endl;
-                    bShouldWait = true;
-                }
+            if ( time_t ts = 0; response_map.GetTopTimestamp( ts ) && ts <= bottom_ts ) {
+                std::cout << "Waiting for unparsed response buffer at " << ts - bottom_ts << " seconds" << std::endl;
+                bShouldWait = true;
             }
 
             if ( !bShouldWait ) {
                 bHadOutput = true;
 
-                prev_time = current_time;
-
-                CAggregateStatsCollection::t_item stats_item;
-                stats.GetItemByKey( current_time, stats_item );
                 std::lock_guard < std::mutex > lock( stats_item->GetMutex() );
                 auto result_map = stats_item->GetStats();
 
@@ -490,7 +510,7 @@ void Aggregate( const std::stop_token & stoken ) {
             break;
         }
 
-        //std::this_thread::sleep_for( std::chrono::seconds( 2 ) );
+        std::this_thread::sleep_for( std::chrono::seconds( 2 ) );
 
         PEventBuffer buffer;
         while ( response_map.GetTopItem( buffer ) ) {
@@ -499,18 +519,21 @@ void Aggregate( const std::stop_token & stoken ) {
                 time_t result_ts = 0;
                 std::string result_code;
 
-                time_t stats_time = CAggregateStatsCollection::GetQuantizedTime( buffer->GetTimestamp() );
+                std::unique_ptr < std::lock_guard < std::mutex > > lock;
+                PAggregateStats stats_item;
+                time_t stats_time = 0;
 
-                CAggregateStatsCollection::t_item stats_item;
-                stats.GetItemByKey( current_time, stats_item );
-                std::lock_guard < std::mutex > lock( stats_item->GetMutex() );
-                auto result_map = stats_item->GetStats();
-
-
-                std::lock_guard < std::mutex > lock( result_map_mutex );
                 while ( buffer->Pop( id, result_code, result_ts ) ) {
                     time_t ts = 0;
                     std::string request;
+                    time_t current_stats_time = CAggregateStatsCollection::GetQuantizedTime( result_ts );
+                    if ( current_stats_time != stats_time || !stats_item ) {
+                        lock.reset();
+                        stats_time = current_stats_time;
+                        stats.GetItemByKey( stats_time, stats_item );
+                        lock = std::make_unique < std::lock_guard < std::mutex > >( stats_item->GetMutex() );
+                    }
+                    auto & result_map = stats_item->GetStats();
                     if ( request_map.GetByID( id, request, ts ) ) {
                         result_map[ request ][ result_code ]++;
                     } else {
