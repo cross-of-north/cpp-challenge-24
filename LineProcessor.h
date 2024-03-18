@@ -8,11 +8,15 @@ class CLineProcessor {
 
     protected:
 
-        static void ParseLineBuffer( const PLineBuffer & buffer );
-        static void ProcessLineBuffers();
+        PContext m_context;
+
+        void ParseLineBuffer( const PLineBuffer & buffer );
+        void ProcessLineBuffers();
+
+        explicit CLineProcessor( PContext context );
 
     public:
 
-        static void Run( const std::stop_token & stoken );
+        static void Run( const std::stop_token & stoken, const PContext & context );
 
 };

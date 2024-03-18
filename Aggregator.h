@@ -13,12 +13,15 @@ class CAggregator {
         std::unique_ptr < std::lock_guard < std::mutex > > m_stats_item_lock;
         PAggregatedStats m_stats_item;
         time_t m_stats_item_ts = 0;
+        PContext m_context;
 
         void UseStatsItem( const time_t ts );
         void ProcessResponseBuffer();
         void ProcessResponseBuffers();
 
+        explicit CAggregator( PContext context );
+
     public:
 
-        static void Run( const std::stop_token & stoken ) ;
+        static void Run( const std::stop_token & stoken, const PContext & context ) ;
 };

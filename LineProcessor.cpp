@@ -6,42 +6,48 @@
 
 CMessageParser mp;
 
+CLineProcessor::CLineProcessor( PContext context )
+    : m_context( std::move( context ) )
+{
+}
+
 void CLineProcessor::ParseLineBuffer( const PLineBuffer & buffer ) {
 
-    DEBUG_OUTPUT && std::cout << to_stream( buffer->GetTimestamp() ) << " start parsing lines" << std::endl;
+    m_context->DEBUG_OUTPUT && std::cout << to_stream( buffer->GetTimestamp() ) << " start parsing lines" << std::endl;
 
     unsigned int line_count = buffer->GetCount();
     for ( unsigned int i = 0; i < line_count; i++ ) {
         mp.ProcessLine( buffer->GetItem( i ) );
         if ( mp.IsDone() ) {
             if ( mp.IsResponse() ) {
-                response_map.Push( buffer->GetTimestamp(), mp.GetTraceID(), mp.GetResultCode() );
+                m_context->response_map.Push( buffer->GetTimestamp(), mp.GetTraceID(), mp.GetResultCode() );
             } else {
-                request_map.Push( buffer->GetTimestamp(), mp.GetTraceID(), mp.GetRequestPath() );
+                m_context->request_map.Push( buffer->GetTimestamp(), mp.GetTraceID(), mp.GetRequestPath() );
             }
         }
     }
 
-    DEBUG_OUTPUT && std::cout << to_stream( buffer->GetTimestamp() ) << " end parsing lines" << std::endl;
+    m_context->DEBUG_OUTPUT && std::cout << to_stream( buffer->GetTimestamp() ) << " end parsing lines" << std::endl;
 
 }
 
 void CLineProcessor::ProcessLineBuffers() {
     PLineBuffer buffer;
-    while ( ready_line_buffers.GetOldestItem( buffer ) ) {
+    while ( m_context->ready_line_buffers.GetOldestItem( buffer ) ) {
         ParseLineBuffer( buffer );
-        response_map.NotifyDataAvailable();
-        ready_line_buffers.RemoveItem( buffer );
+        m_context->response_map.NotifyDataAvailable();
+        m_context->ready_line_buffers.RemoveItem( buffer );
     }
 }
 
-void CLineProcessor::Run( const std::stop_token & stoken ) {
+void CLineProcessor::Run( const std::stop_token & stoken, const PContext & context ) {
     while ( true ) {
-        ready_line_buffers.WaitForData( 100 );
+        context->ready_line_buffers.WaitForData( 100 );
         //std::this_thread::sleep_for( std::chrono::seconds( 2 ) );
-        if ( stoken.stop_requested() && ready_line_buffers.IsEmpty() ) {
+        if ( stoken.stop_requested() && context->ready_line_buffers.IsEmpty() ) {
             break;
         }
-        ProcessLineBuffers();
+        CLineProcessor lp( context );
+        lp.ProcessLineBuffers();
     }
 }

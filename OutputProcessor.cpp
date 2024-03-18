@@ -2,23 +2,18 @@
 
 #include "OutputProcessor.h"
 
+COutputProcessor::COutputProcessor( PContext context )
+    : m_context( std::move( context ) )
+{
+}
+
 void COutputProcessor::DoOutput() {
-    std::ostream * pout = &std::cout;
-    std::unique_ptr < std::ofstream > pout_file;
-    if ( !DUMP_TO_STDOUT ) {
-        pout_file = std::make_unique < std::ofstream >(
-            filename.empty()
-            ?
-            std::to_string( m_stats_ts ) + "-" + std::to_string( m_min_unprocessed_time ) + ".csv"
-            :
-            filename
-        );
-        pout = pout_file.get();
+
+    if ( m_context->DUMP_TO_STDOUT ) {
+        std::cout << "[ " << to_stream( m_stats_ts ) << " .. " << to_stream( m_min_unprocessed_time ) << " )" << std::endl;
     }
 
-    if ( DUMP_TO_STDOUT ) {
-        *pout << "[ " << to_stream( m_stats_ts ) << " .. " << to_stream( m_min_unprocessed_time ) << " )" << std::endl;
-    }
+    std::string s;
 
     std::lock_guard < std::mutex > lock( m_stats_item->GetMutex() );
     auto result_map = m_stats_item->GetStats();
@@ -31,19 +26,28 @@ void COutputProcessor::DoOutput() {
 
     const char * csv_separator = ";";//"\t";
 
-    *pout << "request";
+    s += "request";
     for ( const auto & result_code : result_codes ) {
-        *pout << csv_separator << result_code;
+        s += csv_separator;
+        s += result_code;
     }
     for ( auto & [ request, stats ] : result_map ) {
-        *pout << std::endl;
-        *pout << request;
+        s += "\n";
+        s += request;
         for ( const auto & result_code : result_codes ) {
-            *pout << csv_separator << stats[ result_code ];
+            s += csv_separator;
+            s += std::to_string( stats[ result_code ] );
         }
     }
 
-    *pout << std::endl;
+    if ( !m_context->filename.empty() ) {
+        std::ofstream out_file( m_context->filename );
+        out_file << s;
+    }
+
+    if ( m_context->DUMP_TO_STDOUT ) {
+        std::cout << s << std::endl;
+    }
 
 }
 
@@ -56,7 +60,7 @@ bool COutputProcessor::OutputStats( const bool bForceOutput ) {
     while (
         !bShouldWait
         &&
-        stats.GetOldest( m_stats_item, m_stats_ts )
+        m_context->stats.GetOldest( m_stats_item, m_stats_ts )
         &&
         (
             m_stats_ts < current_time
@@ -67,36 +71,36 @@ bool COutputProcessor::OutputStats( const bool bForceOutput ) {
 
         m_min_unprocessed_time = CAggregatedStatsCollection::GetQuantizedTime( m_stats_ts, +1 );
 
-        if ( time_t ts = 0; filling_line_buffers.GetOldestTimestamp( ts ) && ts < m_min_unprocessed_time ) {
-            DEBUG_OUTPUT && std::cout << "Waiting for unfilled line buffer at " << ts - m_min_unprocessed_time << " seconds" << std::endl;
+        if ( time_t ts = 0; m_context->filling_line_buffers.GetOldestTimestamp( ts ) && ts < m_min_unprocessed_time ) {
+            m_context->DEBUG_OUTPUT && std::cout << "Waiting for unfilled line buffer at " << ts - m_min_unprocessed_time << " seconds" << std::endl;
             bShouldWait = true;
         }
 
-        if ( time_t ts = 0; ready_line_buffers.GetOldestTimestamp( ts ) && ts < m_min_unprocessed_time ) {
-            DEBUG_OUTPUT && std::cout << "Waiting for unparsed line buffer at " << ts - m_min_unprocessed_time << " seconds" << std::endl;
+        if ( time_t ts = 0; m_context->ready_line_buffers.GetOldestTimestamp( ts ) && ts < m_min_unprocessed_time ) {
+            m_context->DEBUG_OUTPUT && std::cout << "Waiting for unparsed line buffer at " << ts - m_min_unprocessed_time << " seconds" << std::endl;
             bShouldWait = true;
         }
 
-        if ( time_t ts = 0; response_map.GetOldestTimestamp( ts ) && ts < m_min_unprocessed_time ) {
-            DEBUG_OUTPUT && std::cout << "Waiting for unparsed response buffer at " << ts - m_min_unprocessed_time << " seconds" << std::endl;
+        if ( time_t ts = 0; m_context->response_map.GetOldestTimestamp( ts ) && ts < m_min_unprocessed_time ) {
+            m_context->DEBUG_OUTPUT && std::cout << "Waiting for unparsed response buffer at " << ts - m_min_unprocessed_time << " seconds" << std::endl;
             bShouldWait = true;
         }
 
         if ( !bShouldWait ) {
             bResult = true;
             DoOutput();
-            stats.RemoveItem( m_stats_item );
+            m_context->stats.RemoveItem( m_stats_item );
         }
     }
 
     return bResult;
 }
 
-void COutputProcessor::Run( const std::stop_token & stoken ) {
+void COutputProcessor::Run( const std::stop_token & stoken, const PContext & context ) {
     bool bHadOutput = false;
     while ( true ) {
         std::this_thread::sleep_for( std::chrono::milliseconds( 100 ) );
-        COutputProcessor op;
+        COutputProcessor op( context );
         if ( op.OutputStats( stoken.stop_requested() && !bHadOutput ) ) {
             bHadOutput = true;
         }

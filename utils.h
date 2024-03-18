@@ -11,17 +11,23 @@ constexpr time_t SECONDS_PER_OUTPUT = 60;
 constexpr time_t REQUEST_LIFETIME_IN_SECONDS = 20;
 
 //#define DEBUG_MEMORY_CONSUMPTION 1
-extern bool DEBUG_OUTPUT;
-
-extern bool DUMP_TO_STDOUT;
-extern std::string filename;
 
 inline auto to_stream( const time_t tp ) {
     return std::put_time( std::localtime( &tp ), "%F %T %Z" );
 }
 
-extern CEventBuffers request_map;
-extern CEventBuffers response_map;
-extern CLineBuffers filling_line_buffers;
-extern CLineBuffers ready_line_buffers;
-extern CAggregatedStatsCollection stats;
+class CContext {
+
+    public:
+
+        bool DEBUG_OUTPUT = false;
+        bool DUMP_TO_STDOUT = true;
+        std::string filename;
+
+        CEventBuffers request_map;
+        CEventBuffers response_map;
+        CLineBuffers filling_line_buffers;
+        CLineBuffers ready_line_buffers;
+        CAggregatedStatsCollection stats;
+};
+typedef std::shared_ptr < CContext > PContext;
