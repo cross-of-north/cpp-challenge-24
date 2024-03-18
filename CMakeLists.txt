@@ -3,4 +3,18 @@ project(untitled)
 
 set(CMAKE_CXX_STANDARD 20)
 
-add_executable(processor main.cpp)
+add_executable(processor
+        main.cpp
+        LineBuffer.cpp
+        LineBuffer.h
+        TimeKeyedCollection.h
+        common.h
+        utils.cpp
+        utils.h
+        EventBuffer.h
+        EventBuffer.cpp
+        AggregatedStats.cpp
+        AggregatedStats.h
+        MessageProcessor.cpp
+        MessageProcessor.h
+)
