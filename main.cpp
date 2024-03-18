@@ -1,4 +1,5 @@
 #include <condition_variable>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -16,6 +17,11 @@ constexpr time_t SECONDS_PER_OUTPUT = 5;
 constexpr time_t REQUEST_LIFETIME_IN_SECONDS = 10;
 
 //#define DEBUG_MEMORY_CONSUMPTION 1
+constexpr bool DEBUG_OUTPUT = false;
+
+auto to_stream( const time_t tp ) {
+    return std::put_time( std::localtime( &tp ), "%F %T %Z" );
+}
 
 class CLineBuffer {
 
@@ -167,7 +173,7 @@ template < typename T > class CTimeKeyedCollection {
             }
         }
 
-        bool GetTop( PT & item, time_t & ts ) const {
+        bool GetOldest( PT & item, time_t & ts ) const {
             item.reset();
             ts = 0;
             std::shared_lock < std::shared_mutex > lock( m_mutex );
@@ -179,7 +185,7 @@ template < typename T > class CTimeKeyedCollection {
             return !!item;
         }
 
-        bool GetBottom( PT & item, time_t & ts ) const {
+        bool GetNewest( PT & item, time_t & ts ) const {
             item.reset();
             ts = 0;
             std::shared_lock < std::shared_mutex > lock( m_mutex );
@@ -191,24 +197,24 @@ template < typename T > class CTimeKeyedCollection {
             return !!item;
         }
 
-        bool GetTopItem( PT & item ) const {
+        bool GetNewestItem( PT & item ) const {
             time_t ts = 0;
-            return GetTop( item, ts );
+            return GetNewest( item, ts );
         }
 
-        bool GetTopTimestamp( time_t & ts ) const {
+        bool GetNewestTimestamp( time_t & ts ) const {
             PT item;
-            return GetTop( item, ts );
+            return GetNewest( item, ts );
         }
 
-        bool GetBottomItem( PT & item ) const {
+        bool GetOldestItem( PT & item ) const {
             time_t ts = 0;
-            return GetBottom( item, ts );
+            return GetOldest( item, ts );
         }
 
-        bool GetBottomTimestamp( time_t & ts ) const {
+        bool GetOldestTimestamp( time_t & ts ) const {
             PT item;
-            return GetBottom( item, ts );
+            return GetOldest( item, ts );
         }
 
         void RemoveItem( const PT & item ) {
@@ -398,22 +404,21 @@ typedef std::shared_ptr < CAggregateStats > PAggregateStats;
 
 class CAggregateStatsCollection : public CTimeKeyedCollection < CAggregateStats > {
     public:
-        static time_t GetQuantizedTime( const time_t ts ) {
-            return ( ts / SECONDS_PER_OUTPUT ) * SECONDS_PER_OUTPUT;
+        static time_t GetQuantizedTime( const time_t ts, const time_t delta = 0 ) {
+            return ( ts / SECONDS_PER_OUTPUT + delta ) * SECONDS_PER_OUTPUT;
         }
 };
 
 CMessageProcessor mp;
 CEventBuffers request_map;
 CEventBuffers response_map;
-CLineBuffers line_buffers;
+CLineBuffers filling_line_buffers;
+CLineBuffers ready_line_buffers;
 CAggregateStatsCollection stats;
-
-PLineBuffer current_line_buffer;
 
 void ParseLineBuffer( const PLineBuffer & buffer ) {
 
-    //std::cout << buffer->GetTimestamp() << " start parse " << buffer->GetCount() << std::endl;
+    DEBUG_OUTPUT && std::cout << to_stream( buffer->GetTimestamp() ) << " start parsing lines" << std::endl;
 
     unsigned int line_count = buffer->GetCount();
     for ( unsigned int i = 0; i < line_count; i++ ) {
@@ -427,7 +432,7 @@ void ParseLineBuffer( const PLineBuffer & buffer ) {
         }
     }
 
-    //std::cout << buffer->GetTimestamp() << " end parse" << std::endl;
+    DEBUG_OUTPUT && std::cout << to_stream( buffer->GetTimestamp() ) << " end parsing lines" << std::endl;
 
 }
 
@@ -441,28 +446,42 @@ void OutputStats( const std::stop_token & stoken ) {
 
         time_t current_time = CAggregateStatsCollection::GetQuantizedTime( time( nullptr ) );
 
+        bool bShouldWait = false;
+
         PAggregateStats stats_item;
         time_t bottom_ts = 0;
         while (
-            ( stats.GetBottom( stats_item, bottom_ts ) && bottom_ts < current_time )
-            ||
-            ( stoken.stop_requested() && !bHadOutput )
+            !bShouldWait
+            &&
+            (
+                ( stats.GetOldest( stats_item, bottom_ts ) && bottom_ts < current_time )
+                ||
+                ( stoken.stop_requested() && !bHadOutput )
+            )
         ) {
 
-            bool bShouldWait = false;
+            time_t min_unprocessed_time = CAggregateStatsCollection::GetQuantizedTime( bottom_ts, 1 );
 
-            if ( time_t ts = 0; line_buffers.GetTopTimestamp( ts ) && ts <= bottom_ts ) {
-                std::cout << "Waiting for unparsed line buffer at " << ts - bottom_ts << " seconds" << std::endl;
+            if ( time_t ts = 0; filling_line_buffers.GetOldestTimestamp( ts ) && ts < min_unprocessed_time ) {
+                DEBUG_OUTPUT && std::cout << "Waiting for unfilled line buffer at " << ts - min_unprocessed_time << " seconds" << std::endl;
                 bShouldWait = true;
             }
 
-            if ( time_t ts = 0; response_map.GetTopTimestamp( ts ) && ts <= bottom_ts ) {
-                std::cout << "Waiting for unparsed response buffer at " << ts - bottom_ts << " seconds" << std::endl;
+            if ( time_t ts = 0; ready_line_buffers.GetOldestTimestamp( ts ) && ts < min_unprocessed_time ) {
+                DEBUG_OUTPUT && std::cout << "Waiting for unparsed line buffer at " << ts - min_unprocessed_time << " seconds" << std::endl;
+                bShouldWait = true;
+            }
+
+            if ( time_t ts = 0; response_map.GetOldestTimestamp( ts ) && ts < min_unprocessed_time ) {
+                DEBUG_OUTPUT && std::cout << "Waiting for unparsed response buffer at " << ts - min_unprocessed_time << " seconds" << std::endl;
                 bShouldWait = true;
             }
 
             if ( !bShouldWait ) {
+
                 bHadOutput = true;
+
+                std::cout << "[ " << to_stream( bottom_ts ) << " .. " << to_stream( min_unprocessed_time ) << " )" << std::endl;
 
                 std::lock_guard < std::mutex > lock( stats_item->GetMutex() );
                 auto result_map = stats_item->GetStats();
@@ -510,10 +529,12 @@ void Aggregate( const std::stop_token & stoken ) {
             break;
         }
 
-        std::this_thread::sleep_for( std::chrono::seconds( 2 ) );
+        //std::this_thread::sleep_for( std::chrono::seconds( 2 ) );
 
         PEventBuffer buffer;
-        while ( response_map.GetTopItem( buffer ) ) {
+        time_t buffer_ts;
+        while ( response_map.GetOldest( buffer, buffer_ts ) ) {
+            DEBUG_OUTPUT && std::cout << to_stream( buffer_ts ) << " start aggregating events" << std::endl;
             {
                 std::string id;
                 time_t result_ts = 0;
@@ -528,6 +549,7 @@ void Aggregate( const std::stop_token & stoken ) {
                     std::string request;
                     time_t current_stats_time = CAggregateStatsCollection::GetQuantizedTime( result_ts );
                     if ( current_stats_time != stats_time || !stats_item ) {
+                        DEBUG_OUTPUT && std::cout << to_stream( current_stats_time ) << " time of events being aggregated" << std::endl;
                         lock.reset();
                         stats_time = current_stats_time;
                         stats.GetItemByKey( stats_time, stats_item );
@@ -541,6 +563,7 @@ void Aggregate( const std::stop_token & stoken ) {
                     }
                 }
             }
+            DEBUG_OUTPUT && std::cout << to_stream( buffer_ts ) << " end aggregating events" << std::endl;
             response_map.RemoveItem( buffer );
         }
 
@@ -552,34 +575,38 @@ void ProcessLineBuffers( const std::stop_token & stoken ) {
 
     while ( true ) {
 
-        line_buffers.WaitForData( 100 );
+        ready_line_buffers.WaitForData( 100 );
 
-        //std::this_thread::sleep_for( std::chrono::seconds( 2 ) );
+        std::this_thread::sleep_for( std::chrono::seconds( 2 ) );
 
-        if ( stoken.stop_requested() && line_buffers.IsEmpty() ) {
+        if ( stoken.stop_requested() && ready_line_buffers.IsEmpty() ) {
             break;
         }
 
         PLineBuffer buffer;
 
-        while ( line_buffers.GetTopItem( buffer ) ) {
+        while ( ready_line_buffers.GetOldestItem( buffer ) ) {
             ParseLineBuffer( buffer );
             response_map.NotifyDataAvailable();
-            line_buffers.RemoveItem( buffer );
+            ready_line_buffers.RemoveItem( buffer );
         }
     }
 }
 
-void FlushLineBuffer() {
-    if ( current_line_buffer ) {
-        line_buffers.AddItem( current_line_buffer->GetTimestamp(), current_line_buffer );
-        line_buffers.NotifyDataAvailable();
+void FlushLineBuffers() {
+    PLineBuffer buffer;
+    time_t buffer_ts;
+    while ( filling_line_buffers.GetOldest( buffer, buffer_ts ) ) {
+        ready_line_buffers.AddItem( buffer_ts, buffer );
+        filling_line_buffers.RemoveItem( buffer );
     }
+    ready_line_buffers.NotifyDataAvailable();
 }
 
 void ReadSTDIN( const std::stop_token & stoken ) {
 
     bool bPrevEmptyLine = false;
+    PLineBuffer current_line_buffer;
     while ( std::cin.good() && !stoken.stop_requested() ) {
         std::string input;
         std::getline( std::cin, input );
@@ -589,14 +616,19 @@ void ReadSTDIN( const std::stop_token & stoken ) {
             ||
             ( current_line_buffer->GetTimestamp() != ts && bPrevEmptyLine && !input.empty() )
         ) {
-            FlushLineBuffer();
+            if ( current_line_buffer ) {
+                DEBUG_OUTPUT && std::cout << to_stream( current_line_buffer->GetTimestamp() ) << " end collecting lines" << std::endl;
+            }
+            FlushLineBuffers();
             current_line_buffer = std::make_shared < CLineBuffer >( ts );
+            filling_line_buffers.AddItem( ts, current_line_buffer );
+            DEBUG_OUTPUT && std::cout << to_stream( ts ) << " start collecting lines" << std::endl;
         }
         current_line_buffer->Push( input );
         bPrevEmptyLine = input.empty();
         //std::cout << input << std::endl;
     }
-    FlushLineBuffer();
+    FlushLineBuffers();
 
 }
 
