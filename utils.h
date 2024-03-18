@@ -7,7 +7,7 @@
 
 constexpr time_t SECONDS_PER_LINE_BUFFER = 1;
 constexpr time_t SECONDS_PER_EVENT_BUFFER = 1;
-constexpr time_t SECONDS_PER_OUTPUT = 5;
+constexpr time_t SECONDS_PER_OUTPUT = 60;
 constexpr time_t REQUEST_LIFETIME_IN_SECONDS = 20;
 
 //#define DEBUG_MEMORY_CONSUMPTION 1
