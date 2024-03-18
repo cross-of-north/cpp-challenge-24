@@ -10,14 +10,18 @@
 #include <shared_mutex>
 #include <thread>
 #include <vector>
+#include <fstream>
 
 constexpr time_t SECONDS_PER_LINE_BUFFER = 1;
 constexpr time_t SECONDS_PER_EVENT_BUFFER = 1;
-constexpr time_t SECONDS_PER_OUTPUT = 5;
-constexpr time_t REQUEST_LIFETIME_IN_SECONDS = 10;
+constexpr time_t SECONDS_PER_OUTPUT = 60;
+constexpr time_t REQUEST_LIFETIME_IN_SECONDS = 20;
 
 //#define DEBUG_MEMORY_CONSUMPTION 1
-constexpr bool DEBUG_OUTPUT = false;
+bool DEBUG_OUTPUT = true;
+
+bool DUMP_TO_STDOUT = true;
+std::string filename;
 
 auto to_stream( const time_t tp ) {
     return std::put_time( std::localtime( &tp ), "%F %T %Z" );
@@ -449,18 +453,18 @@ void OutputStats( const std::stop_token & stoken ) {
         bool bShouldWait = false;
 
         PAggregateStats stats_item;
-        time_t bottom_ts = 0;
+        time_t stats_ts = 0;
         while (
             !bShouldWait
             &&
             (
-                ( stats.GetOldest( stats_item, bottom_ts ) && bottom_ts < current_time )
+                ( stats.GetOldest( stats_item, stats_ts ) && stats_ts < current_time )
                 ||
                 ( stoken.stop_requested() && !bHadOutput )
             )
         ) {
 
-            time_t min_unprocessed_time = CAggregateStatsCollection::GetQuantizedTime( bottom_ts, 1 );
+            time_t min_unprocessed_time = CAggregateStatsCollection::GetQuantizedTime( stats_ts, +1 );
 
             if ( time_t ts = 0; filling_line_buffers.GetOldestTimestamp( ts ) && ts < min_unprocessed_time ) {
                 DEBUG_OUTPUT && std::cout << "Waiting for unfilled line buffer at " << ts - min_unprocessed_time << " seconds" << std::endl;
@@ -481,7 +485,22 @@ void OutputStats( const std::stop_token & stoken ) {
 
                 bHadOutput = true;
 
-                std::cout << "[ " << to_stream( bottom_ts ) << " .. " << to_stream( min_unprocessed_time ) << " )" << std::endl;
+                std::ostream * pout = &std::cout;
+                std::unique_ptr < std::ofstream > pout_file;
+                if ( !DUMP_TO_STDOUT ) {
+                    pout_file = std::make_unique < std::ofstream >(
+                        filename.empty()
+                        ?
+                        std::to_string( stats_ts ) + "-" + std::to_string( min_unprocessed_time ) + ".csv"
+                        :
+                        filename
+                    );
+                    pout = pout_file.get();
+                }
+
+                if ( DUMP_TO_STDOUT ) {
+                    *pout << "[ " << to_stream( stats_ts ) << " .. " << to_stream( min_unprocessed_time ) << " )" << std::endl;
+                }
 
                 std::lock_guard < std::mutex > lock( stats_item->GetMutex() );
                 auto result_map = stats_item->GetStats();
@@ -494,19 +513,19 @@ void OutputStats( const std::stop_token & stoken ) {
 
                 const char * csv_separator = ";";//"\t";
 
-                std::cout << "request";
+                *pout << "request";
                 for ( const auto & result_code : result_codes ) {
-                    std::cout << csv_separator << result_code;
+                    *pout << csv_separator << result_code;
                 }
                 for ( auto & [ request, stats ] : result_map ) {
-                    std::cout << std::endl;
-                    std::cout << request;
+                    *pout << std::endl;
+                    *pout << request;
                     for ( const auto & result_code : result_codes ) {
-                        std::cout << csv_separator << stats[ result_code ];
+                        *pout << csv_separator << stats[ result_code ];
                     }
                 }
 
-                std::cout << std::endl;
+                *pout << std::endl;
 
                 stats.RemoveItem( stats_item );
             }
@@ -639,7 +658,19 @@ void Cleanup( const std::stop_token & stoken ) {
     }
 }
 
-int main() {
+int main( const int argc, const char **argv ) {
+
+    DEBUG_OUTPUT = false;
+
+    if ( argc > 1 ) {
+        if ( argc == 3 && argv[ 1 ] == std::string( "-o" ) ) {
+            DUMP_TO_STDOUT = false;
+            filename = argv[ 2 ];
+        } else {
+            std::cout << "Usage: " << argv[ 0 ] << " [-o <output file>]" << std::endl;
+            return -1;
+        }
+    }
 
     auto read_thread = std::jthread( ReadSTDIN );
     auto cleanup_thread = std::jthread( Cleanup );
