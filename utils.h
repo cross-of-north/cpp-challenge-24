@@ -1,13 +1,18 @@
 #pragma once
 
 #include "common.h"
-#include "LineBuffer.h"
-#include "EventBuffer.h"
+#include "LineBucket.h"
+#include "EventBucket.h"
 #include "AggregatedStats.h"
 
-constexpr time_t SECONDS_PER_LINE_BUFFER = 1;
-constexpr time_t SECONDS_PER_EVENT_BUFFER = 1;
+// values other than 1 are not tested
+constexpr time_t SECONDS_PER_LINE_BUCKET = 1;
+constexpr time_t SECONDS_PER_EVENT_BUCKET = 1;
+
+// width of the aggregated time interval
 constexpr time_t SECONDS_PER_OUTPUT = 60;
+
+// maximum time to wait for the response to arrive before dropping request data
 constexpr time_t REQUEST_LIFETIME_IN_SECONDS = 20;
 
 //#define DEBUG_MEMORY_CONSUMPTION 1
@@ -16,6 +21,10 @@ inline auto to_stream( const time_t tp ) {
     return std::put_time( std::localtime( &tp ), "%F %T %Z" );
 }
 
+//
+// Data accessed from different threads.
+// Thread-safety is provided separately for every field.
+//
 class CContext {
 
     public:
@@ -24,10 +33,10 @@ class CContext {
         bool DUMP_TO_STDOUT = true;
         std::string filename;
 
-        CEventBuffers request_map;
-        CEventBuffers response_map;
-        CLineBuffers filling_line_buffers;
-        CLineBuffers ready_line_buffers;
+        CEventBuckets request_map;
+        CEventBuckets response_map;
+        CLineBuckets filling_line_buckets;
+        CLineBuckets ready_line_buckets;
         CAggregatedStatsCollection stats;
 };
 typedef std::shared_ptr < CContext > PContext;

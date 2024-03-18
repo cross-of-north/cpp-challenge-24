@@ -7,6 +7,9 @@
 #include "Aggregator.h"
 #include "OutputProcessor.h"
 
+//
+// Cleans up old request buckets from the request_map
+//
 void Cleanup( const std::stop_token & stoken, const PContext & context ) {
     while ( !stoken.stop_requested() ) {
         std::this_thread::sleep_for( std::chrono::seconds( 1 ) );
@@ -16,6 +19,7 @@ void Cleanup( const std::stop_token & stoken, const PContext & context ) {
 
 int main( const int argc, const char **argv ) {
 
+    // common variables which should be accessible from all threads
     PContext context( std::make_shared<CContext>() );
 
     if ( argc > 1 ) {
@@ -28,10 +32,11 @@ int main( const int argc, const char **argv ) {
         }
     }
 
-    // pipeline:
     //
-    // LineReader -> (CLineBuffers ready_line_buffers) ->
-    //  -> LineProcessor -> (CEventBuffers request_map, response_map) ->
+    // Data pipeline:
+    //
+    // LineReader -> (CLineBuckets ready_line_buckets) ->
+    //  -> LineProcessor -> (CEventBuckets request_map, response_map) ->
     //  -> Aggregator -> (CAggregatedStatsCollection) ->
     //  -> OutputProcessor -> (file)
     //
@@ -42,7 +47,7 @@ int main( const int argc, const char **argv ) {
     auto aggregate_thread = std::jthread( CAggregator::Run, context );
     auto output_thread = std::jthread( COutputProcessor::Run, context );
 
-    read_thread.join();
+    read_thread.join();  // this will block until the STDIN pipe or file is closed
 
     cleanup_thread.request_stop();
     cleanup_thread.join();

@@ -3,6 +3,9 @@
 #include "common.h"
 #include "utils.h"
 
+//
+// Performs periodic output of aggregated stats for the interval of time ensuring that all interval data are processed prior to output
+//
 class COutputProcessor {
 
     protected:

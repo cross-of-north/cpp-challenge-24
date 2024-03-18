@@ -4,14 +4,17 @@
 
 #include "utils.h"
 
+//
+// Implements conversion of lines received to request/response events, drops processed line buckets
+//
 class CLineProcessor {
 
     protected:
 
         PContext m_context;
 
-        void ParseLineBuffer( const PLineBuffer & buffer );
-        void ProcessLineBuffers();
+        void ParseLineBucket( const PLineBucket & bucket );
+        void ProcessLineBuckets();
 
         explicit CLineProcessor( PContext context );
 

@@ -1,27 +1,27 @@
 #include "common.h"
 
-#include "EventBuffer.h"
+#include "EventBucket.h"
 
 #include "utils.h"
 
-CEventBuffer::CEventBuffer() {
+CEventBucket::CEventBucket() {
 #ifdef DEBUG_MEMORY_CONSUMPTION
-    std::cout << "CEventBuffer()" << std::endl;
+    std::cout << "CEventBucket()" << std::endl;
 #endif // DEBUG_MEMORY_CONSUMPTION
 }
 
-CEventBuffer::~CEventBuffer() {
+CEventBucket::~CEventBucket() {
 #ifdef DEBUG_MEMORY_CONSUMPTION
-    std::cout << "~CEventBuffer()" << std::endl;
+    std::cout << "~CEventBucket()" << std::endl;
 #endif // DEBUG_MEMORY_CONSUMPTION
 }
 
-void CEventBuffer::Push( const time_t ts, const std::string & id, const std::string & s ) {
+void CEventBucket::Push( const time_t ts, const std::string & id, const std::string & s ) {
     std::unique_lock < std::shared_mutex > lock( m_mutex );
     m_events.emplace( std::make_pair( id, std::make_tuple( ts, s ) ) );
 }
 
-bool CEventBuffer::GetByID( const std::string & id, std::string & value, time_t & ts ) const {
+bool CEventBucket::GetByID( const std::string & id, std::string & value, time_t & ts ) const {
     bool bResult = false;
     value.clear();
     ts = 0;
@@ -35,7 +35,7 @@ bool CEventBuffer::GetByID( const std::string & id, std::string & value, time_t 
     return bResult;
 }
 
-bool CEventBuffer::Pop( std::string & id, std::string & value, time_t & ts ) {
+bool CEventBucket::Pop( std::string & id, std::string & value, time_t & ts ) {
     bool bResult = false;
     id.clear();
     value.clear();
@@ -52,24 +52,26 @@ bool CEventBuffer::Pop( std::string & id, std::string & value, time_t & ts ) {
     return bResult;
 }
 
-void CEventBuffers::Push( const time_t ts, const std::string & id, const std::string & s ) {
-    time_t time_key = ts / SECONDS_PER_EVENT_BUFFER;
-    PEventBuffer event_buffer;
-    GetItemByKey( time_key, event_buffer );
-    if ( event_buffer ) {
-        event_buffer->Push( ts, id, s );
+void CEventBuckets::Push( const time_t ts, const std::string & id, const std::string & s ) {
+    time_t time_key = ts / SECONDS_PER_EVENT_BUCKET;
+    PEventBucket event_bucket;
+    GetItemByKey( time_key, event_bucket );
+    if ( event_bucket ) {
+        event_bucket->Push( ts, id, s );
     } else {
         // assert( false );
     }
 }
 
-bool CEventBuffers::GetByID( const std::string & id, std::string & value, time_t & ts ) const {
+bool CEventBuckets::GetByID( const std::string & id, std::string & value, time_t & ts ) const {
     bool bResult = false;
     value.clear();
     ts = 0;
     std::shared_lock < std::shared_mutex > lock( m_mutex );
-    for ( const auto & [ buffer_timestamp, buffer ] : std::ranges::reverse_view( m_container ) ) {
-        if ( buffer->GetByID( id, value, ts ) ) {
+    // buckets are checked in reverse iterator order (starting from the newest) because the probability
+    // of finding a request in recent request buckets is higher (optimistically assuming that the request is processed quickly)
+    for ( const auto & [ bucket_timestamp, bucket ] : std::ranges::reverse_view( m_container ) ) {
+        if ( bucket->GetByID( id, value, ts ) ) {
             bResult = true;
             break;
         }

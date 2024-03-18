@@ -5,14 +5,14 @@ set(CMAKE_CXX_STANDARD 20)
 
 add_executable(processor
         main.cpp
-        LineBuffer.cpp
-        LineBuffer.h
+        LineBucket.cpp
+        LineBucket.h
         TimeKeyedCollection.h
         common.h
         utils.cpp
         utils.h
-        EventBuffer.h
-        EventBuffer.cpp
+        EventBucket.h
+        EventBucket.cpp
         AggregatedStats.cpp
         AggregatedStats.h
         MessageParser.cpp
