@@ -2,7 +2,7 @@
 
 #include "common.h"
 
-class CMessageProcessor {
+class CMessageParser {
     protected:
 #ifdef _DEBUG
         std::string m_message;

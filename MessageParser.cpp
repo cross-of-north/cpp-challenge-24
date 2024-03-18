@@ -1,8 +1,8 @@
 #include "common.h"
 
-#include "MessageProcessor.h"
+#include "MessageParser.h"
 
-void CMessageProcessor::Reset() {
+void CMessageParser::Reset() {
 #ifdef _DEBUG
     m_message.clear();
 #endif // _DEBUG
@@ -13,7 +13,7 @@ void CMessageProcessor::Reset() {
     m_bDone = false;
 }
 
-void CMessageProcessor::ProcessFirstLine( const std::string & line ) {
+void CMessageParser::ProcessFirstLine( const std::string & line ) {
     m_bIsResponse = ( line.rfind( "HTTP/", 0 ) == 0 );
     auto second_token_start = line.find( ' ' );
     if ( second_token_start != std::string::npos ) {
@@ -30,14 +30,14 @@ void CMessageProcessor::ProcessFirstLine( const std::string & line ) {
     }
 }
 
-void CMessageProcessor::ProcessHeaderLine( const std::string & line ) {
+void CMessageParser::ProcessHeaderLine( const std::string & line ) {
     static const std::string trace_id_prefix( "X-Trace-ID: " );
     if ( line.rfind( trace_id_prefix, 0 ) == 0 ) {
         m_trace_id = line.substr( trace_id_prefix.length() );
     }
 }
 
-void CMessageProcessor::ProcessLine( const std::string & line ) {
+void CMessageParser::ProcessLine( const std::string & line ) {
     if ( line.empty() ) {
         m_bDone = true;
     } else {
@@ -54,22 +54,22 @@ void CMessageProcessor::ProcessLine( const std::string & line ) {
     }
 }
 
-bool CMessageProcessor::IsDone() const {
+bool CMessageParser::IsDone() const {
     return m_bDone;
 }
 
-bool CMessageProcessor::IsResponse() const {
+bool CMessageParser::IsResponse() const {
     return m_bIsResponse;
 }
 
-const std::string & CMessageProcessor::GetRequestPath() const {
+const std::string & CMessageParser::GetRequestPath() const {
     return m_request_path;
 }
 
-const std::string & CMessageProcessor::GetTraceID() const {
+const std::string & CMessageParser::GetTraceID() const {
     return m_trace_id;
 }
 
-const std::string & CMessageProcessor::GetResultCode() const {
+const std::string & CMessageParser::GetResultCode() const {
     return m_result_code;
 }

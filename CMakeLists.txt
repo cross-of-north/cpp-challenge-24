@@ -15,6 +15,14 @@ add_executable(processor
         EventBuffer.cpp
         AggregatedStats.cpp
         AggregatedStats.h
-        MessageProcessor.cpp
-        MessageProcessor.h
+        MessageParser.cpp
+        MessageParser.h
+        OutputProcessor.cpp
+        OutputProcessor.h
+        Aggregator.cpp
+        Aggregator.h
+        LineProcessor.cpp
+        LineProcessor.h
+        LineReader.cpp
+        LineReader.h
 )
