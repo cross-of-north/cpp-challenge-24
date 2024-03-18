@@ -9,14 +9,12 @@ RUN apk update && \
 WORKDIR /source
 RUN git clone  https://github.com/cross-of-north/cpp-challenge-24
 WORKDIR /source/cpp-challenge-24/build
-RUN cmake -DCMAKE_BUILD_TYPE=Release .. && \
-    cmake --build . --parallel 8
-COPY ../generator .
-CMD cd /source/cpp-challenge-24 && \
+CMD set -x && \
+		cd /source/cpp-challenge-24 && \
 		git pull && \
 		cd build && \
     cmake -DCMAKE_BUILD_TYPE=Release .. && \
     cmake --build . --parallel 8 && \
     cp ../generator . && \
-		( ./generator|./processor ) && \
+		( ./generator | ./processor -o out.csv ) && \
 		/bin/sh
